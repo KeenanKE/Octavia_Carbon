@@ -1,108 +1,91 @@
-#include <SPI.h>                     // For SPI communication with ADS1118
-#include <Wire.h>                    // For I2C communication with OLED
-#include <Adafruit_GFX.h>           // Adafruit graphics library
-#include <Adafruit_SSD1306.h>       // OLED driver library
+#include <SPI.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 
-// ----- OLED Display Configuration -----
+// OLED Settings
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
-#define OLED_RESET     -1            // No reset pin used
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
-// ----- SPI Pins for ADS1118 (connected to ESP32 VSPI bus) -----
-#define CS_PIN     5                // Chip select for ADS1118
-#define SCLK_PIN  18                // SPI clock
-#define MISO_PIN  19                // Master In Slave Out
-#define MOSI_PIN  23                // Master Out Slave In
+// ADS1118 SPI
+#define CS 5    // D5
+#define V_REF 3.3  // ADS1118 reference voltage
+#define GAIN 51.0  // INA333 gain
+#define RTD_CURRENT 0.001  // 1 mA from LM134
 
-// ----- RTD Selection Pin -----
-#define RTD_SELECT_PIN 4            // GPIO to detect selected RTD type (LOW = Pt100, HIGH = Pt1000)
-
-// ----- Constants -----
-const float VREF = 5.0;             // Reference voltage of ADS1118 (assuming it's powered from 5V)
-const float ADC_RESOLUTION = 32768.0; // 16-bit signed ADC full-scale value
-const float I_EXCITATION = 0.00025;   // 250 µA excitation current set by LM134
+// RTD constants
+#define ALPHA 0.00385  // 3850 ppm/°C
 
 void setup() {
-  // ----- Configure pin modes -----
-  pinMode(CS_PIN, OUTPUT);                // Chip Select for SPI
-  pinMode(RTD_SELECT_PIN, INPUT_PULLUP); // Read RTD selection switch
-  
-  // ----- Initialize SPI -----
-  SPI.begin(SCLK_PIN, MISO_PIN, MOSI_PIN, CS_PIN);
-
-  // ----- Initialize Serial Monitor -----
   Serial.begin(115200);
+  SPI.begin(); // SCK=18, MISO=19, MOSI=23, CS=5
+  pinMode(CS, OUTPUT);
+  digitalWrite(CS, HIGH);
 
-  // ----- Initialize OLED Display -----
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println(F("SSD1306 OLED display not found"));
-    while (true); // Stop execution if display is not found
+    Serial.println(F("OLED not found"));
+    while (1);
   }
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
+  delay(100);
 }
 
-// ----- Read a single conversion result from ADS1118 -----
 uint16_t readADS1118() {
-  // Configuration: single-shot, AIN0, 4.096V range, 128 SPS, default settings
-  uint16_t config = 0x8583;
+  uint16_t config = 0b1000001000000011; // AIN0-AIN1, ±4.096V, single-shot
+  byte configMSB = config >> 8;
+  byte configLSB = config & 0xFF;
 
-  digitalWrite(CS_PIN, LOW);          // Start SPI transaction
-  SPI.transfer16(config);             // Send config (starts conversion)
-  delay(10);                          // Wait for conversion to complete
-  uint16_t result = SPI.transfer16(config); // Read ADC result
-  digitalWrite(CS_PIN, HIGH);         // End SPI transaction
+  digitalWrite(CS, LOW);
+  SPI.transfer(configMSB);
+  SPI.transfer(configLSB);
+  digitalWrite(CS, HIGH);
 
-  return result;
-}
+  delay(10); // Wait for conversion
 
-// ----- Convert voltage to resistance using Ohm's Law -----
-float resistanceFromVoltage(float v) {
-  return v / I_EXCITATION; // R = V / I
-}
+  digitalWrite(CS, LOW);
+  byte resMSB = SPI.transfer(0x00);
+  byte resLSB = SPI.transfer(0x00);
+  digitalWrite(CS, HIGH);
 
-// ----- Convert resistance to temperature (Pt100 or Pt1000) -----
-float temperatureFromResistance(float R, bool isPt100) {
-  float R0 = isPt100 ? 100.0 : 1000.0;   // Nominal resistance at 0°C
-  float alpha = 0.00385;                 // Temperature coefficient for RTDs
-  return (R - R0) / (R0 * alpha);        // Inverse of: R = R0 * (1 + αT)
+  return ((resMSB << 8) | resLSB);
 }
 
 void loop() {
-  // ----- Determine which RTD is selected -----
-  bool isPt100 = digitalRead(RTD_SELECT_PIN) == LOW;
+  int16_t raw = readADS1118();
+  float voltage = (raw * V_REF) / 32768.0;
+  float rtd_voltage = voltage / GAIN;
+  float rtd_resistance = rtd_voltage / RTD_CURRENT;
 
-  // ----- Read raw ADC data -----
-  uint16_t raw = readADS1118();
-  int16_t signed_raw = (int16_t)raw;     // Convert to signed 16-bit integer
-  float voltage = (signed_raw / ADC_RESOLUTION) * VREF; // Convert ADC code to voltage
+  // Determine RTD type from resistance range
+  String rtdType;
+  float tempC;
+  if (rtd_resistance < 200.0) {
+    rtdType = "Pt100";
+    tempC = (rtd_resistance - 100.0) / (ALPHA * 100.0);
+  } else {
+    rtdType = "Pt1000";
+    tempC = (rtd_resistance - 1000.0) / (ALPHA * 1000.0);
+  }
 
-  // ----- Calculate resistance and temperature -----
-  float resistance = resistanceFromVoltage(voltage);
-  float temperature = temperatureFromResistance(resistance, isPt100);
+  // Output to Serial
+  Serial.print("RTD: ");
+  Serial.print(rtdType);
+  Serial.print(" | Resistance: ");
+  Serial.print(rtd_resistance, 2);
+  Serial.print(" Ohms | Temp: ");
+  Serial.print(tempC, 2);
+  Serial.println(" C");
 
-  // ----- Display results on OLED -----
+  // Output to OLED
   display.clearDisplay();
   display.setCursor(0, 0);
-  display.print("RTD Type: ");
-  display.println(isPt100 ? "Pt100" : "Pt1000");
-
-  display.print("Voltage: ");
-  display.print(voltage, 4);
-  display.println(" V");
-
-  display.print("Resistance: ");
-  display.print(resistance, 1);
-  display.println(" Ohms");
-
-  display.print("Temp: ");
-  display.print(temperature, 1);
-  display.println(" C");
-
+  display.print("RTD Type: "); display.println(rtdType);
+  display.print("Resistance: "); display.print(rtd_resistance, 1); display.println(" Ohm");
+  display.print("Temp: "); display.print(tempC, 1); display.println(" C");
   display.display();
 
-  // ----- Delay before next reading -----
   delay(1000);
 }
